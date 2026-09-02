@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: grid-wallet
+    runtime: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./public
+    pullRequestPreviewsEnabled: false
+    headers:
+      - path: /*
+        name: Cache-Control
+        value: public, max-age=0, must-revalidate

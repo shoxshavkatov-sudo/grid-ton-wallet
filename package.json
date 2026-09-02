@@ -1,0 +1,21 @@
+{
+  "name": "grid-ton-wallet",
+  "version": "1.0.0",
+  "description": "GRID WALLET — a non-custodial TON blockchain wallet (Tonkeeper-style).",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "esbuild src/main.js --bundle --minify --target=es2020 --outfile=public/app.bundle.js --legal-comments=none",
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@ton/core": "^0.62.0",
+    "@ton/crypto": "^3.3.0",
+    "@ton/ton": "^15.1.0",
+    "esbuild": "^0.24.0"
+  },
+  "license": "MIT"
+}
