@@ -130,6 +130,21 @@ function applyLang() {
   document.documentElement.lang = LANG;
 }
 
+// surface any JS error on screen instead of an eternal spinner
+function fatal(msg) {
+  const el = document.getElementById('view');
+  if (!el) return;
+  el.innerHTML = `<div class="narrow"><div class="empty">⚠ ${esc(String(msg).slice(0, 200))}<br><button class="btn ghost" style="width:auto;margin-top:10px;padding:8px 18px" onclick="location.reload()">reload</button></div></div>`;
+}
+window.addEventListener('error', (e) => { if (!SESSION_BOOTED) fatal(e.message); });
+window.addEventListener('unhandledrejection', (e) => { if (!SESSION_BOOTED) fatal(e.reason && e.reason.message || e.reason); });
+let SESSION_BOOTED = false;
+setTimeout(() => {
+  if (!SESSION_BOOTED && document.getElementById('view')?.textContent.trim() === 'loading the grid…') {
+    fatal('app failed to start — check your connection');
+  }
+}, 6000);
+
 // ---------------------------------------------------------------- wallet core
 const KEYS = 'gw_keys';
 const loadKeys = () => { try { return JSON.parse(localStorage.getItem(KEYS)); } catch { return null; } };
@@ -173,8 +188,11 @@ async function decryptSeed(enc, password) {
 }
 
 // ---------------------------------------------------------------- TON network
+const TON_TIMEOUT = 8000;
 const toncenter = async (method, params) => {
-  const r = await fetch(`https://toncenter.com/api/v2/${method}?` + new URLSearchParams(params));
+  const r = await fetch(`https://toncenter.com/api/v2/${method}?` + new URLSearchParams(params), {
+    signal: AbortSignal.timeout(TON_TIMEOUT),
+  });
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || 'toncenter error');
   return j.result;
@@ -190,7 +208,8 @@ async function fetchState(addr) {
 
 async function fetchPrice() {
   try {
-    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd');
+    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',
+      { signal: AbortSignal.timeout(TON_TIMEOUT) });
     const j = await r.json();
     return j['the-open-network'].usd;
   } catch { return 0; }
@@ -198,7 +217,8 @@ async function fetchPrice() {
 
 async function fetchJettons(addr) {
   try {
-    const r = await fetch(`https://tonapi.io/v2/accounts/${addr}/jettons?currencies=usd`);
+    const r = await fetch(`https://tonapi.io/v2/accounts/${addr}/jettons?currencies=usd`,
+      { signal: AbortSignal.timeout(TON_TIMEOUT) });
     const j = await r.json();
     return (j.balances || [])
       .filter((b) => Number(b.balance) > 0)
@@ -400,10 +420,7 @@ function renderUnlock(keys) {
 async function renderWallet() {
   const keys = loadKeys();
   const addr = keys.address;
-  viewEl.innerHTML = `<div class="loading">…</div>`;
-  const [state, price] = await Promise.all([fetchState(addr), fetchPrice()]);
-  const usd = state.balance * price;
-
+  // skeleton first — never block the UI on the network
   viewEl.innerHTML = `
     <div class="narrow">
       <div class="pay-card">
@@ -411,15 +428,15 @@ async function renderWallet() {
           <span class="pc-brand"><span class="mini-grid"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>TON</span>
           <span class="pc-mode">GRID WALLET</span>
         </div>
-        <div class="pc-bal mono">${fmtT(state.balance)}</div>
+        <div class="pc-bal mono" id="bal">…</div>
         <div class="pc-unit">TONCOIN</div>
-        ${price > 0 ? `<div class="pc-equiv"><span>≈ <b class="mono">$${fmtT(usd, 2)}</b></span></div>` : ''}
+        <div class="pc-equiv" id="eq"></div>
         <div class="pc-bottom">
           <button class="pc-addr mono" id="pc-copy" title="${t('copy')}">${short(addr)} ⧉</button>
           <span class="pc-net"><span class="live-dot"></span>TON MAINNET</span>
         </div>
       </div>
-      ${!state.active && state.balance === '0' ? `<p class="note warn" style="margin:-6px 2px 12px">${t('activate')}</p>` : ''}
+      <p class="note warn" id="act-note" style="display:none;margin:-6px 2px 12px"></p>
       <div class="quick2">
         <button class="btn" id="w-receive">▽ ${t('receive')}</button>
         <button class="btn ghost" id="w-send">▲ ${t('send')}</button>
@@ -442,7 +459,43 @@ async function renderWallet() {
       </div>
       <div id="jets"></div>
     </div>`;
+  bindWalletHandlers(addr);
 
+  // network data fills in async; a failure shows a retry note, never a blank page
+  let state, price;
+  try {
+    [state, price] = await Promise.all([fetchState(addr), fetchPrice()]);
+  } catch (e) {
+    const bal = document.getElementById('bal');
+    if (bal) bal.textContent = '—';
+    const note = document.getElementById('act-note');
+    if (note) { note.style.display = 'block'; note.textContent = '⚠ ' + ((e && e.message) || 'network error') + ' — retrying…'; }
+    poll(async () => { if (!typing()) route(); }, 10000);
+    return;
+  }
+  const bal = document.getElementById('bal');
+  if (bal) bal.textContent = fmtT(state.balance);
+  const eq = document.getElementById('eq');
+  if (eq && price > 0) eq.innerHTML = `<span>≈ <b class="mono">$${fmtT(state.balance * price, 2)}</b></span>`;
+  if (!state.active && Number(state.balance) === 0) {
+    const note = document.getElementById('act-note');
+    if (note) { note.style.display = 'block'; note.textContent = t('activate'); }
+  }
+  bindWalletHandlers(addr, state);
+  fetchJettons(addr).then((jets) => {
+    if (!jets.length || !document.getElementById('jets')) return;
+    document.getElementById('jets').innerHTML = `
+      <div class="sec-title">${t('jettons')}</div>
+      <div class="chip-row">${jets.map((j) => `
+        <span class="chip">
+          ${j.image ? `<img src="${esc(j.image)}" alt="">` : ''}
+          <span><b>${esc(j.symbol)}</b><br><span class="mono">${fmtT(j.amount, 2)}</span></span>
+        </span>`).join('')}</div>`;
+  });
+  poll(async () => { if (!typing()) route(); }, 15000);
+}
+
+function bindWalletHandlers(addr, state) {
   $('#pc-copy').onclick = () => copyText(addr);
   $('#w-receive').onclick = () => {
     const p = $('#receive-panel');
@@ -460,7 +513,7 @@ async function renderWallet() {
     try { Address.parseFriendly(to); } catch { okAddr = false; }
     if (!okAddr) return toast(t('badAddr'));
     if (!(amt > 0)) return toast(t('amountTons'));
-    if (amt + 0.01 > Number(state.balance)) return toast(t('lowBalance'));
+    if (state && amt + 0.01 > Number(state.balance)) return toast(t('lowBalance'));
     $('#s-go').disabled = true;
     try {
       await sendTON(SESSION.mnemonic, to, $('#s-amt').value.trim(), cm);
@@ -472,19 +525,6 @@ async function renderWallet() {
       toast((e && e.message) || 'send failed');
     } finally { $('#s-go').disabled = false; }
   };
-
-  fetchJettons(addr).then((jets) => {
-    if (!jets.length || !document.getElementById('jets')) return;
-    document.getElementById('jets').innerHTML = `
-      <div class="sec-title">${t('jettons')}</div>
-      <div class="chip-row">${jets.map((j) => `
-        <span class="chip">
-          ${j.image ? `<img src="${esc(j.image)}" alt="">` : ''}
-          <span><b>${esc(j.symbol)}</b><br><span class="mono">${fmtT(j.amount, 2)}</span></span>
-        </span>`).join('')}</div>`;
-  });
-
-  poll(async () => { if (!typing()) route(); }, 12000);
 }
 
 // ---------------------------------------------------------------- activity
@@ -558,4 +598,5 @@ async function renderSettings() {
     route();
   };
   route();
+  SESSION_BOOTED = true;
 })();
